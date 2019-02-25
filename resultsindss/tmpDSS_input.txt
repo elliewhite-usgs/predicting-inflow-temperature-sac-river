@@ -1,0 +1,5 @@
+newdata_results_rf1.dss
+EV data=//RESERVOIR A/rfp_trin//1HOUR/MACHINE LEARNING/ UNITS=  TYPE=INST-VAL
+EF [DATE]  [TIME]  [data]
+EF.M --- 
+IMP tmpDSS_output.txt
