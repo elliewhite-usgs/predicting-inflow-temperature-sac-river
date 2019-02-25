@@ -1,0 +1,1304 @@
+---
+title: "data_prep"
+author: "Ellie White"
+date: "September 21, 2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+Record of ml with a random and blocking test/train split for sacramento river. New data to predict is the trinity river. 
+
+# Contents
+1.0 Data Gathering
+2.0 Data Visualizations
+3.0 Data Prep for Machine Learning
+4.0 Interpolation with Trees
+5.0 Measures of Fit
+6.0 Benchmarking
+7.0 Comparisons of Different Model Types
+8.0 Outliers
+9.0 Predicting to New Data (Trinity R.)
+10.0 Blocking in time
+11.0 Model Fit
+12.0 Plots
+13.0 Exporting to DSS
+
+# Libraries
+Hmisc         -- for plotting labels
+hexbin        -- for plotting
+grid          -- for plotting
+corpcor       -- for corplots
+corrplot      -- for corplots
+rpart         -- for CARTs
+rattle        -- for tree plots
+randomForest  -- for random forests
+rnn           -- for training neural networks 
+ggplot2       -- for plotting
+forecast      -- for timeseries analysis
+tseries       -- for timeseries analysis
+dismo         -- for the folds
+plyr          -- for dataframe processing
+foreach       -- for parallelization
+doParallel    -- for parallelization
+astsa         -- for tsplot()
+
+# Citations
+
+
+```{r, include=FALSE}
+library(knitr)
+library(formatR)
+opts_chunk$set(
+  fig.width  = 7.5,
+  fig.height = 7.5,
+  collapse   = TRUE,
+  tidy       = FALSE
+)
+```
+
+# 1.0 Data Gathering
+
+## 1.1 Response Variable
+```{r rv_cdec}
+# response variable: observed temperatures of the Merced river into lake McClure
+# source: Don Smith's corrected CDEC data  
+watertemp <- read.csv("inputdata/CDEC/watertemp_sacramentoaboveshastalake_1hr.csv")
+watertemp$DATETIME <- as.POSIXct(strptime(watertemp$DATE, "%d %b %y, %H:%M"))
+watertemp$DATE <- as.Date(watertemp$DATETIME)
+watertemp$TIME <- format(watertemp$DATETIME, format="%H:%M") 
+watertemp <- watertemp[,c(3, 1, 4, 2)]
+```
+
+## 1.2 Predictor Variables
+```{r pv_met}
+# predictor variables: meteorogical data, inflow temperatures of closest station (McCloud), reservoir flow data 
+airtemp <- read.csv("inputdata/MET/airtemp_trinity_1hr.csv")
+dewpoint <- read.csv("inputdata/MET/dewpoint_trinity_1hr.csv")
+eqtemp <- read.csv("inputdata/MET/eqtemp_trinity_1hr.csv")
+exrate <- read.csv("inputdata/MET/exrate_trinity_1hr.csv")
+pooltemp <- read.csv("inputdata/MET/pooltemp_trinity_1hr.csv")
+swrad <- read.csv("inputdata/MET/swrad_trinity_1hr.csv")
+swrad$SWRAD_BTUPF2 <- as.numeric(swrad$SWRAD_BTUPF2)
+windspeed <- read.csv("inputdata/MET/windspeed_trinity_1hr.csv")
+
+# since this is already clean join the met data into one dataframe
+met_df <- cbind(airtemp, dewpoint$DEWPOINT_DEGF, eqtemp$EQTEMP_DEGF, exrate$EXRATE_BTUPF2PDPDEGF, pooltemp$POOLTEMP_DEGF, swrad$SWRAD_BTUPF2, windspeed$WINDSPEED_KNOTS)
+colnames (met_df) <- c("DATE", "AIRTEMP", "DEWPOINT", "EQTEMP", "EXRATE", "POOLTEMP", "SWRAD", "WINDSPEED")
+
+met_df$DATETIME <- as.POSIXct(strptime(met_df$DATE, "%d %b %y, %H:%M"))
+met_df$DATE <- as.Date(met_df$DATETIME)
+met_df$TIME <- format(met_df$DATETIME, format="%H:%M") 
+met_df <- met_df[,c(9, 1, 10, 2:8)]
+```
+
+```{r pv_cdec}
+watertemp_mc <- read.csv("inputdata/CDEC/watertemp_mccloudaboveshastalake_1hr.csv")
+watertemp_mc$DATETIME <- as.POSIXct(strptime(watertemp_mc$DATE, "%d %b %y, %H:%M"))
+watertemp_mc$DATE <- as.Date(watertemp_mc$DATETIME)
+watertemp_mc$TIME <- format(watertemp_mc$DATETIME, format="%H:%M") 
+watertemp_mc <- watertemp_mc[,c(3,1,4,2)]
+
+flow_mc <- read.csv("inputdata/CDEC/obsflow_mccloudaboveshastalake_1hr.csv")
+flow_mc$DATETIME <- as.POSIXct(strptime(flow_mc$DATE, "%d %b %y, %H:%M"))
+flow_mc$DATE <- as.Date(flow_mc$DATETIME)
+flow_mc$TIME <- format(flow_mc$DATETIME, format="%H:%M") 
+flow_mc <- flow_mc[,c(3, 1, 4, 2)]
+flow_mc$MC_FLOW <- as.numeric(flow_mc$MC_FLOW)
+
+resflow <- read.csv("inputdata/CDEC/resinflow_sacramentoaboveshastalake_1hr.csv")
+resflow$DATETIME <- as.POSIXct(strptime(resflow$DATE, "%d %b %y, %H:%M"))
+resflow$DATE <- as.Date(resflow$DATETIME)
+resflow$TIME <- format(resflow$DATETIME, format="%H:%M") 
+resflow <- resflow[,c(3, 1, 4, 2)]
+resflow$RESINFLOW <- as.numeric(resflow$RESINFLOW)
+
+# new data flow
+resflow_trin <- read.csv("inputdata/CDEC/resinflow_abovelaketrinity_1day.csv")
+resflow_trin$DATE <- as.Date(resflow_trin$DATE, "%d %b %y, %H:%M")
+resflow_trin$RESINFLOW_TRIN <- as.numeric(resflow_trin$RESINFLOW_TRIN)
+```
+
+```{r data_join}
+# reorder the dates and make a df to be later used in machine learning
+df <- met_df
+df <- merge(df, watertemp_mc[, c(1, ncol(watertemp_mc))], by="DATETIME")
+df <- merge(df, flow_mc[, c(1, ncol(flow_mc))], by="DATETIME")
+df <- merge(df, resflow[, c(1, ncol(resflow))], by="DATETIME")
+df <- merge(df, watertemp[, c(1, ncol(watertemp))], by="DATETIME")
+```
+
+```{r pv_timeandseason}
+# 3 pm is on average the hottest time of day in california
+df$TIMEOFDAY <- 15 - sapply(strsplit(df$TIME,":"),
+  function(x) {
+    x <- as.numeric(x)
+    x[1]+x[2]/60
+  }
+)
+
+# 185 julian day corresponds to July 4th (the hottest day of the year in california? not sure, but it is in the physical equations)
+df$DAYOFYEAR <- 185 - as.numeric(format(df$DATE, "%j"))
+
+df$MONTH <- as.factor(format(df$DATE,"%b"))
+
+# make a season finding function
+getseason <- function(dates) {
+    WS <- as.Date("2012-12-15", format = "%Y-%m-%d") # Winter Solstice
+    SE <- as.Date("2012-3-15",  format = "%Y-%m-%d") # Spring Equinox
+    SS <- as.Date("2012-6-15",  format = "%Y-%m-%d") # Summer Solstice
+    FE <- as.Date("2012-9-15",  format = "%Y-%m-%d") # Fall Equinox
+
+    # Convert dates from any year to 2012 dates
+    d <- as.Date(strftime(dates, format="2012-%m-%d"))
+
+    ifelse (d >= WS | d < SE, "Winter",
+      ifelse (d >= SE & d < SS, "Spring",
+        ifelse (d >= SS & d < FE, "Summer", "Fall")))
+}
+df$SEASON <- as.factor(getseason(df$DATE))
+
+# order the columns
+df <- df[,c(1:3,15:18,4:14)]
+
+# label the variables in the dataframe for plotting purposes
+library(Hmisc) 
+var_labels = c("Datetime", "Date", "Time", "Time of Day", "Day of Year", "Month", "Season", "Air Temp", "Dew Point", "Eq Temp", "Ex Rate", "Pool Temp", "Sw Radiation", "Wind Speed", "MC Water Temp", "MC Flow", "Res Inflow", "Water Temp")
+names(var_labels) <- names(df)
+label(df) = lapply(names(var_labels), function(x) label(df[,x]) = var_labels[x])
+```
+
+```{r rfdf}
+rfdf <- df
+rfdf <- na.omit(rfdf)
+# 140233-128097=12136 NAs removed, that is about 8% of the data
+```
+
+# 2.0 Data Visualizations
+```{r datavis}
+cols <- character(nrow(rfdf))
+cols[] <- "black"
+cols[rfdf$WATERTEMP >= mean(rfdf$WATERTEMP)] <- "goldenrod"
+cols[rfdf$WATERTEMP < mean(rfdf$WATERTEMP)] <- "darkblue"
+
+png('outputdata/Rplot01_temp.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex = 1, mgp = c(2,1,0))
+plot(sort(rfdf$WATERTEMP), ylab=substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " (")), xlab="Rank of Sorted Observations", ylim=c(0,100))
+dev.off()
+
+# use the ecdf() function to obtain the empirical CDF values
+png('outputdata/Rplot01_tempcdf.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,4,1,1)+0.1, ps=8, cex = 1, mgp = c(2,1,0))
+plot(ecdf(rfdf$WATERTEMP), xlim=c(30,90), xlab = substitute(paste('Sorted Temperature', B * degree, "F)"),  list(B = " (")), ylab = '', main="", do.points=TRUE, panel.first=c(abline(v=seq(30,90,10), lty=3, col="grey"), abline(h=seq(0,1,0.2), lty=3, col="grey")))
+# add label for y-axis
+# the "line" option is used to set the position of the label
+mtext(text = expression(hat(F)[n](x)), side = 2, line = 3)
+mtext(text='Percentiles for Hourly Water Temperature', side=2, line=2)
+dev.off()
+
+png('outputdata/Rplot02_tmpvsdewpoint.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex = 1, mgp = c(2,1,0))
+plot(rfdf$SWRAD, rfdf$AIRTEMP, col = alpha(cols, 0.1), xlab=expression(paste("Surface Water Radiation (BTU/F"^2,")")), ylab=substitute(paste('Air Temperature', B * degree, "F)"),  list(B = " (")), pch=16)
+legend("bottomright", horiz=FALSE, inset=c(0.01, 0.01), c("low temp", "high temp"), pch=c(16,16), col=c("darkblue","goldenrod"), bg="grey96")
+dev.off()
+
+# smoothscatter not working for this plot
+# png('outputdata/Rplot02_tmpvsdewpoint.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+# par(mar=c(3,3,1,1)+0.1, ps=8, cex = 1, mgp = c(2,1,0))
+# smoothScatter(rfdf$SWRAD, rfdf$AIRTEMP, nbin=100)
+# , nrpoints=Inf, xlab=substitute(paste('Observed Temperature', B * degree, "F)"),  list(B = " (")), ylab=substitute(paste('Predicted Temperature', B * degree, "F)"),  list(B = " (")), main="random cv",
+# , col=cols, xlab=expression(paste("Surface Water Radiation (BTU/F"^2,")")), ylab=substitute(paste('Air Temperature', B * degree, "F)"),  list(B = " (")))
+# legend("bottomright", horiz=FALSE, inset=c(0.01, 0.01), cex=0.6, c("low temp", "high temp"), pch=c(1,1), col=c("darkblue","goldenrod"), bg="grey96")
+# dev.off()
+
+# this is plotting the wrong thing. The third dimension has to be water temperature, but here it's just the number of points that fall into that hexbin
+library(hexbin)
+library(grid)
+png('outputdata/Rplot02_tmpvsdewpoint2.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex=1)
+hexbinplot(AIRTEMP ~ SWRAD, data=rfdf, xlab="", ylab="", xbins=20, shape=4/8, aspect = 1, cex.labels=0.6, cex.title=0.8, lcex=0.75)
+grid.text(expression(paste("Surface Water Radiation (BTU/F"^2,")")), .45, .05, gp=gpar(fontsize=8))
+grid.text(substitute(paste('Air Temperature', B * degree, "F)"),  list(B = " (")), .05, .5, rot=90, gp=gpar(fontsize=8))
+dev.off()
+
+# correlation plot
+png('outputdata/Rplot03_corrwithflow.png', width=3.25, height=2.85, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+corrdf <- cor(rfdf[,-c(1:3, 6:7)])[13, 1:13]
+# for labeling the plot merge corrdf with labels in rfdf
+corrdf <- merge(data.frame(corrdf), data.frame(label(rfdf)), by=0)
+corrdf <- corrdf[order(corrdf$corrdf,decreasing=FALSE),]
+dotchart(corrdf$corrdf, xlim=c(-0.4,1.1), xlab="Correlation Coefficient", pch=19, pt.cex=0.7)
+axis(side = 2, seq_along(corrdf[,1]), corrdf[,3], las=1, tick=FALSE)
+text(x=corrdf$corrdf, y=1:length(corrdf$corrdf), labels=round(corrdf$corrdf,2), pos=4, cex=0.8)
+abline(v=0, col="grey", lty=2)
+dev.off()
+
+# In R, there are several packages for getting the partial correlation coefficients along with the t- test for checking their significance level. Use the ‘ppcor’ package to compute the partial correlation coefficients along with the t-statistic and corresponding p-values.corpcor had a better way of calculating the partial correlations without so many errors in the covariance matrix not being positive definite and being singular.
+
+library(corpcor) # cor2pcor computes the pairwise partial correlation coefficients from either a correlation or a covariance matrix
+png('outputdata/Rplot03_partialcorrwithflow.png', width=3.25, height=2.85, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+corrdf <- cor(rfdf[,-c(1:3, 6:7)])
+pcorrdf <- cor2pcor(corrdf)
+pcorrdf <- pcorrdf[ncol(pcorrdf), 1:ncol(pcorrdf)]
+pcorrdf <- cbind(data.frame(pcorrdf), data.frame(label(rfdf)[-c(1:3, 6:7)]))
+colnames(pcorrdf)[2] <- "LABEL"
+pcorrdf <- pcorrdf[order(pcorrdf$pcorrdf,decreasing=FALSE),]
+dotchart(pcorrdf[,1], xlim=c(-0.5,1.1), xlab="Partial Correlation Coefficient", pch=19, pt.cex=0.7)
+axis(side = 2, seq_along(pcorrdf[,1]), pcorrdf[,2], las=1, tick=FALSE) 
+text(x=pcorrdf[1:nrow(pcorrdf),1], y=1:nrow(pcorrdf), labels=round(pcorrdf[1:nrow(pcorrdf),1],2), pos=4, cex=0.8)
+abline(v=0, col="grey80", lty=2)
+dev.off()
+
+# draw a correlolgram
+library(corrplot)
+png('outputdata/Rplot04_corrplot.png', width=6.5, height=5.69, units="in", pointsize=12, res=1200)
+par(mar=c(4,1,0,0)+0.1, ps=10, cex=1)
+cols <- colorRampPalette(c('darkred','grey80','darkblue'))
+rfdf_c <- rfdf
+colnames(rfdf_c) <- label(rfdf)
+corrplot(cor(rfdf_c[,-c(1:3, 6,7)]), order="hclust", tl.col="black", method="color", addCoef.col="white",  addCoefasPercent=TRUE, col=cols(100), tl.pos="lt", diag=FALSE, cl.pos="r", tl.cex=1, number.cex=0.7, tl.srt = 90)
+dev.off()
+```
+
+# 3.0 Data Prep for Machine Learning
+
+## 3.1 Random Test/Train Split
+```{r prep}
+# set seed to ensure reproducible results
+set.seed(20170727)
+
+# don't need this, go straight to blocking section
+# # for missing data in the record: k-fold cv
+# # split randomly into train and test datasets, 80/20 split
+# rfdf[,"train"] <- ifelse(runif(nrow(rfdf)) < 0.8, 1, 0)
+# 
+# # separate training and test sets
+# trainset <- rfdf[rfdf$train==1, ]
+# testset <- rfdf[rfdf$train==0, ]
+# 
+# # get column index of train flag
+# traincolnum <- grep("train", names(trainset))
+# 
+# # remove train flag column from train and test sets
+# trainset <- trainset[, -traincolnum]
+# testset <- testset[, -traincolnum]
+```
+
+# 4.0 Interpolation with Trees  
+
+## 4.1 CART
+```{r cart}
+library(rpart)
+cart <- rpart(WATERTEMP~TIMEOFDAY+DAYOFYEAR+MONTH+SEASON+AIRTEMP+DEWPOINT+EQTEMP+EXRATE+POOLTEMP+SWRAD+WINDSPEED+MC_WATERTEMP+MC_FLOW+RESINFLOW, data=trainset, method="anova")
+
+# print a table of optimal prunings based on a complexity parameter
+printcp(cart)
+
+# plot a complexity parameter table for the rpart fit, or a visual representation of the cross-validation results
+png('outputdata/Rplot05_cartsize.png', width=6.5, height=4.9, units="in", pointsize=12, res=1200)
+par(mar=c(4.5,4.5,4.5,3)+0.1)
+plotcp(cart)
+dev.off()
+
+# pdf('outputdata/Rplot06_1.pdf')
+# par(mar = c(1, 3, 1, 1))
+# plot(cart, uniform=TRUE, margin=0.1, compress=TRUE)
+# text(cart, use.n=TRUE, all=TRUE, cex=0.5)
+# dev.off()
+
+library(rattle)
+png('outputdata/Rplot06_cart.png', width=6.5, height=4.9, units="in", pointsize=12, res=1200)
+par(mar=c(2,2,2,2)+0.1)
+fancyRpartPlot(cart, sub="", cex=0.75)
+dev.off()
+```
+
+```{r cart_predicting}
+# use this model to predict to test data set
+cartp <- predict(cart, testset[, 4:(ncol(testset)-1)], type="vector")
+
+#calculate RMS error
+cart_rmsqe <- sqrt(mean((cartp-testset$WATERTEMP)^2))
+cart_rmsqe
+
+# plot
+plot(sort(cartp), col="goldenrod", main="CART--Predicted vs. Observed", ylab="Unimpaired Flow (AF)", ylim=c(0,100), pch=19)
+points(sort(testset$WATERTEMP), col="darkblue", pch=19)
+legend("topleft", inset=0.05, cex=0.8, title="Legend", c("Observed", "Predicted"), horiz=FALSE, pch=c(19,19), col=c("darkblue","goldenrod"))
+```
+CART gives us a nice result to look at that can be easily interpreted, but the approach suffers from high variance. Therefore, let's look at producing a random forests.  
+
+## 4.2 Random Forest
+```{r rf_function}
+library(randomForest)
+
+buildrf <- function(modelname, traindf, trainingcols, trainobscol, testdf){
+  modelname <- deparse(substitute(modelname))
+  
+  # build rf
+  trf <- tuneRF(traindf[ , trainingcols], traindf[ , trainobscol])
+  mt <- trf[which.min(trf[,2]), 1]
+  rrf <- randomForest(traindf[ , trainingcols], traindf[ , trainobscol], mtry=mt)
+  
+  # predict with rf
+  RFP <- predict(rrf, testdf[, trainingcols], type="response")
+  testset_results <- cbind(testdf, RFP)
+  testset_results_sorted <- testset_results[order(testdf[ , trainobscol]),]
+  RFP <- predict(rrf, traindf[, trainingcols], type="response")
+  trainset_results <- cbind(traindf, RFP)
+  
+  #----------------------------------------PLOTS-------------------------------------
+  png(paste0('outputdata/Rplot07_trf_', modelname,'.png'), width=6.5, height=4.9, units="in", pointsize=12, res=1200)
+  par(mar=c(4.5,4.5,1,1)+0.1)
+  plot(trf, pch=19, yla="Out-Of-Bag Error", xlab="mtry (Number of Variables Randomly Sampled at Each Split)")
+  lines(trf)
+  dev.off()
+
+  png(paste0('outputdata/Rplot08_rrf_', modelname,'.png'), width=4.5, height=4.9, units="in", pointsize=12, res=1200)
+  par(mar=c(4.5,4.5,1,1)+0.1)
+  plot(rrf, main="")
+  dev.off()
+
+  png(paste0('outputdata/Rplot09_varimp_', modelname,'.png'), width=4.5, height=4.9, units="in", pointsize=12, res=1200)
+  par(mar=c(4.5,4.5,1,1)+0.1)
+  imprrf <- merge(data.frame(importance(rrf)), data.frame(label(rfdf)), by=0)
+  imprrf <- imprrf[order(imprrf$IncNodePurity, decreasing=FALSE),]
+  varImpPlot(rrf, main="", pch=19, labels=imprrf[,3])
+  dev.off()
+   
+  png(paste0('outputdata/Rplot10_obsvspred_', modelname,'.png'), width=4.5, height=4.9, units="in", pointsize=12, res=1200)
+  par(mar=c(4.5,4.5,1,1)+0.1)
+  abs_error <- abs(testset_results_sorted[ , trainobscol]-testset_results_sorted$RFP)
+  plot(testset_results_sorted$RFP, col=ifelse(abs_error>=5,"red","goldenrod"), ylab="Water Temp (F)", ylim=c(0,100), xlab="Rank Sorted Observations")
+  points(testset_results_sorted[ , trainobscol], col="darkblue")
+  legend("topleft", inset=0.05, cex=0.8, title="Legend", c("Observed", "Predicted"), horiz=FALSE, pch=c(1,1), col=c("darkblue","goldenrod"), bg="grey96")
+  dev.off()
+  
+  png(paste0('outputdata/Rplot11_obsvspred_', modelname,'.png'), width=4.5, height=4.9, units="in", pointsize=12, res=1200)
+  par(mar=c(4.5,4.5,1,1)+0.1)
+  plot(testset_results_sorted[ , trainobscol], testset_results_sorted$RFP, xlab="Observed Water Temp (F)", ylab="Predicted Water Temp (F)", ylim=c(min(testset_results_sorted[ , trainobscol]), max(testset_results_sorted[ , trainobscol])), xlim=c(min(testset_results_sorted[ , trainobscol]), max(testset_results_sorted[ , trainobscol])))
+  abline(0,1, col="goldenrod")
+  lmline <- lm(testset_results_sorted$RFP~testset_results_sorted[ , trainobscol])
+  abline(lmline, lty=2, col="darkblue")
+  legend("topleft", inset=0.05, cex=0.8, title="Legend", c("Y = X line", "regression line"), horiz=FALSE, lty=c(1,2), col=c("goldenrod","darkblue"), bg="grey96")
+  text(par("usr")[2]-25,par("usr")[4]-30, pos=4, paste("Y =", round(lmline$coefficients[2],3), "X +", round(lmline$coefficients[1],0)), cex=0.8, col="darkblue")
+  text(par("usr")[2]-20,par("usr")[4]-30, pos=1, paste("R2 =", round(summary(lmline)$r.squared, 3)), cex=0.8, col="darkblue")
+  dev.off()
+  
+  png(paste0('outputdata/Rplot12_timeseries_', modelname,'.png'), width=8.5, height=4.9, units="in", pointsize=12, res=1200)
+  par(mar=c(4.5,4.5,1,1)+0.1)
+  abs_error2 <- abs(testset_results[ , trainobscol]-testset_results$RFP)
+  plot(testset_results$DATETIME, testset_results$RFP, ylab="Water Temp (F)", xlab="", xaxt="n", col=ifelse(abs_error2>=5,"red","goldenrod"))
+  axis.POSIXct(side=1, testset_results$DATETIME, at=cut(testset_results$DATETIME, "years"), format="%m/%d/%y", las=2)
+  points(testset_results$DATETIME, testset_results[ , trainobscol], col="darkblue")
+  legend("topleft", inset=0.025, cex=0.8, title="Legend", c("Observed", "Predicted"), horiz=FALSE, pch=c(1,1), col=c("darkblue","goldenrod"), bg="grey96")
+  dev.off()
+  #----------------------------------------------------------------------------------
+
+  return(list(TRF=trf, MT=mt, RRF=rrf, TESTRESULTS=testset_results, TRAINRESULTS=trainset_results))
+}
+```
+
+# 5.0 Measures of Fit
+
+## 5.1 AE, RE, R2, RMSE(AF), NSE, RSR, PBIAS functions 
+```{r mof_functions}
+ae <- function(obs, pred){
+  l <- pred-obs
+  return(l)
+}
+
+re <- function(obs, pred){
+  l <- 2*(obs-pred)/(obs+pred)
+  return(l)
+}
+
+r2 <- function(obs, pred){
+  l1 <- summary(lm(pred~obs))$coefficients[2] # the slope of the obs. vs. pred. is the R2 model fit (always)
+  l2 <- summary(lm(obs~pred))$coefficients[2] # do this to return the slope less than 1
+  l <- ifelse(l1<l2, l1, l2)
+  return(l)
+}
+
+rmse <- function(obs, pred){
+  l <- sqrt(mean((pred-obs)^2))
+  return(l)
+}
+
+nse <- function(obs, pred){
+  l <- 1-sum((pred-obs)^2)/sum((obs-mean(obs))^2)
+  return(l)
+}
+
+rsr <- function(obs, pred){
+  l <- sqrt(sum((pred-obs)^2))/sqrt(sum((obs-mean(obs))^2))
+  return(l)
+}
+
+pbias <- function(obs, pred){
+  l <- sum((pred-obs))*100/sum(obs)
+  return(l)
+}
+
+# in one dataframe
+modelmof <- function(modelname, category, obs, pred){
+  modelname <- deparse(substitute(modelname))
+  category <- deparse(substitute(category))
+  
+  # calculate all the measures of fit
+  ae_category <- ae(obs, pred)
+  re_category <- re(obs, pred)
+  r2_category <- r2(obs, pred)
+  rmse_category <- rmse(obs, pred)
+  nse_category <- nse(obs, pred)
+  rsr_category <- rsr(obs, pred)
+  pbias_category <- pbias(obs, pred)
+  
+  # put it all in a dataframe
+  mof_category <- rbind(length(ae_category), mean(ae_category), mean(re_category), r2_category, nse_category, rmse_category, rsr_category, pbias_category)
+  rownames(mof_category) <- c("num obs", "mean(ae)", "mean(re)", "r2", "nse", "rmse", "rsr", "pbias")
+  colnames(mof_category) <- paste(modelname, category)
+  mof_category_rounded <- round(mof_category, 3)
+}
+```
+
+# 6.0 Benchmarking
+
+## 6.1 Linear Multi-Variate Regression
+```{r lmr}
+# # the parameters beta for each predictor variable is determined by minimizing the Residual Sum of Squares (RSS). to fit the regression model use the function lm ():
+# lm_watertemp <- lm(WATERTEMP_DEGF~TIMEOFDAY+DAYOFYEAR+MONTH+SEASON+AIRTEMP+DEWPOINT+EQTEMP+EXRATE+POOLTEMP+SWRAD+WINDSPEED+MS_WATERTEMP_DEGF+MS_FLOW_CFS+SS_WATERTEMP_DEGF+SS_FLOW_CFS+FLOW_CFS, data=testset)
+# 
+# # use the function summary() to get some results :
+# summary(lm_watertemp, corr=TRUE)
+# 
+# # Create a table with fitted values and residuals
+# lm_results <- data.frame(testset, LM_FITTED=fitted(lm_watertemp), LM_RESIDUAL=resid(lm_watertemp))
+# 
+# # the Analysis of Variance (ANOVA) breaks the total variability observed in the sample into two parts: Total Sample Variablity (TSS) = Variability Explained by the model (SSreg) + Unexplained (or error) Variablity (RSS)
+# anova(lm_watertemp)
+# 
+# # obtaining the confidence bands: Reflect the uncertainty about the regression line (how well the line is determined).
+# head(predict(lm_watertemp, interval="confidence"))
+# 
+# # obtaining the prediction bands: Include also the uncertainty about future observations
+# head(predict(lm_watertemp, interval="prediction"))
+# 
+# # diagnostics plots
+# # par(mfrow=c(1,4))
+# # plot(lm_watertemp, which=1:4)
+# 
+# # add results of the predictions to testset_results
+# testset_results <- testset
+# testset_results$LMRP <- lm_results$LM_FITTED
+# 
+# # measures of fit
+# lmr_mof_testset <- modelmof(lmr, test, testset_results$WATERTEMP_DEGF, testset_results$LMRP)
+# 
+# # predict to trainset
+# lmrp_train <- predict(lm_watertemp, newdata = trainset) 
+# trainset_results <- cbind(trainset_results, lmrp_train)
+```
+
+## 6.2 Equilibrium Temperature Modeling
+```{r heceq}
+# # HEC5Q input computed inflow eq temperatures for benchmarking
+# eqtemp_1day <- read.csv("Benchmarking/HEC5Q/watertemp_merced_1day.csv")
+# eqtemp_1day$DATE <- as.Date(eqtemp_1day$DATE, "%d-%b-%y")
+# 
+# eqtemp_6hr <- read.csv("Benchmarking/HEC5Q/watertemp_merced_6hr.csv")
+# eqtemp_6hr$DATE <- as.POSIXct(strptime(eqtemp_6hr$DATE, "%d%b%Y  %H%M"))
+# colnames(eqtemp_6hr)[1] <- "DATETIME"
+# 
+# # join eqtemp results to the test set results by date 
+# testset_results_merged <- merge(testset_results, eqtemp_1day, by="DATE")
+# testset_results_merged2 <- merge(testset_results_merged, eqtemp_6hr, by="DATETIME")
+# 
+# # measures of fit !!! these are wrong, calc again
+# eqtempd_mof_testset <- modelmof(eqtempd, test, testset_results_merged$WATERTEMP_DEGF, testset_results_merged$HEC5QD_WATERTEMP_DEGF)
+# eqtemp6h_mof_testset <- modelmof(eqtemp6h, test, testset_results_merged2$WATERTEMP_DEGF, testset_results_merged2$HEC5Q6H_WATERTEMP_DEGF)
+```
+
+## 6.3 RNN Model
+```{r rnn}
+library(rnn)
+
+# a.	Standardize the data: make sure the right transformations are chosen. If the model did not converge or spitted out weird results this may be the culprit. 
+rfdf_std <- rfdf
+
+normalize <- function(x){
+    return ((x-min(x))/(max(x)-min(x)))
+}
+
+rfdf_std <- as.data.frame(lapply(rfdf[ ,c(4,5,8:ncol(rfdf))], normalize))
+rfdf_std <- cbind(rfdf[ ,1:3], rfdf_std[ ,1:2], rfdf[ ,6:7], rfdf_std[ ,3:ncol(rfdf_std)])
+
+# if there is a need for outliers to get weighted more than the other values, z-score standardization technique suits better. In order to achieve z-score standardization, one could use R’s built-in scale() function.
+
+# separate training and test sets
+trainset_std <- rfdf_std[rfdf_std$train==1, ]
+testset_std <- rfdf_std[rfdf_std$train==0, ]
+
+# get column index of train flag
+traincolnum_std <- grep("train", names(trainset_std))
+
+# remove train flag column from train and test sets
+trainset_std <- trainset_std[, -traincolnum_std]
+testset_std <- testset_std[, -traincolnum_std]
+
+# b.	Pick the correct number of hidden nodes and epochs. The upwards and downwards paths of the predictions following the observations may be easy to tweak, while hitting the peaks and valleys may be problematic. 
+
+# c.	Fit the RNN.
+rnn1 <- rnn:::trainr(Y = trainset_std[ ,ncol(trainset_std)],
+                X = trainset_std[ ,1:(ncol(trainset_std)-1)],
+                learningrate = 0.05,
+                hidden_dim = 16,
+                numepochs = 1500)
+
+# d.	Evaluate and iterate.
+rnn1p <- predictr(model, X)
+
+# e.	The Long short-term memory (LSTM) is a recurrent neural network (RNN) but better at keeping events “in memory”. Try this if needed.
+
+# f.	Report performance on different epochs (make it a gif, could be cool to see how the model’s predictions converge the longer you let it run).
+
+```
+
+## 6.4 ARIMA model
+```{r arima}
+library(ggplot2)
+library(forecast)
+library(tseries)
+
+rfdf_dcp <- rfdf[,c(1,2,4:ncol(rfdf))]
+
+# plot time series
+ggplot(rfdf_dcp, aes(DATE, WATERTEMP_DEGF)) + geom_line() + scale_x_date('month')  + ylab("Water Temp (deg f)") + xlab("Time")
+
+# clean data? Don't need any of this since the data is already clean
+# count_ts <- ts(rfdf_dcp[, c('WATERTEMP_DEGF')])
+# rfdf_dcp$clean_cnt <- tsclean(count_ts)
+# ggplot() + geom_line(data = rfdf_dcp, aes(x = DATE, y = clean_cnt)) + ylab('Water Temp (deg f)')
+
+rfdf_dcp$wtmp_ma <- ma(rfdf_dcp$WATERTEMP_DEGF, order=7) 
+rfdf_dcp$wtmp_ma30 <- ma(rfdf_dcp$WATERTEMP_DEGF, order=30)
+
+ggplot() +
+  geom_line(data = rfdf_dcp, aes(x = DATE, y = WATERTEMP_DEGF, colour = "Observed")) +
+  geom_line(data = rfdf_dcp, aes(x = DATE, y = wtmp_ma,   colour = "Weekly Moving Average"))  +
+  geom_line(data = rfdf_dcp, aes(x = DATE, y = wtmp_ma30, colour = "Monthly Moving Average"))  +
+  ylab('Water Temp (deg f)')
+
+# decompose the seasonality, trends and cyclical components of the data: Use decompose() or stl() to examine and possibly remove components of the time series data.
+
+rfdf_dcp_seas <- decompose(rfdf_dcp$WATERTEMP_DEGF)
+rfdf_dcp_comp <- stl(rfdf_dcp$WATERTEMP_DEGF)
+
+wtmp_ma <- ts(na.omit(rfdf_dcp$wtmp_ma), frequency=30)
+decomp <- stl(wtmp_ma, s.window="periodic")
+deseasonal_wtmp <- seasadj(decomp)
+plot(decomp)
+
+# stationarity: Use adf.test(), ACF, PACF plots to determine order of differencing needed. 
+
+# a formal ADF test does reject (p-value=0.0968) the null hypothesis of non-stationarity, confirming our visual inspection that the data is stationary.
+adf.test(wtmp_ma, alternative = "stationary")
+Acf(wtmp_ma, main='')
+Pacf(wtmp_ma, main='')
+
+# to get an even smaller p-value We can start with the order of d = 1 and re-evaluate whether further differencing is needed.
+wtmp_d1 <- diff(deseasonal_wtmp, differences = 1)
+plot(wtmp_d1)
+adf.test(wtmp_d1, alternative = "stationary")
+Acf(wtmp_d1, main='ACF for Differenced Series')
+Pacf(wtmp_d1, main='PACF for Differenced Series')
+
+# autocorrelations: examine plots and determine the model order.
+
+# fit ARIMA: read up on the Box-Jenkins method of fitting so you know what’s going on.
+auto.arima(deseasonal_wtmp, seasonal=FALSE)
+arima_fit <- auto.arima(deseasonal_wtmp, seasonal=FALSE)
+tsdisplay(residuals(arima_fit), lag.max=45, main='(1,1,1) Model Residuals')
+
+# evaluate and iterate.
+arima_fit2 <- arima(deseasonal_wtmp, order=c(1,1,7))
+arima_fit2
+tsdisplay(residuals(arima_fit2), lag.max=15, main='Seasonal Model Residuals')
+
+# forecasting
+fcast <- forecast(arima_fit2, h=1200)
+plot(fcast)
+
+# forecasting with a hold out set to evaluate how well the model does
+hold <- window(ts(deseasonal_wtmp), start=700)
+fit_no_holdout <- arima(ts(deseasonal_wtmp[-c(700:725)]), order=c(1,1,7))
+fcast_no_holdout <- forecast(fit_no_holdout, h=25)
+plot(fcast_no_holdout, main=" ")
+lines(ts(deseasonal_wtmp))
+
+# different model
+fit_w_seasonality <-  auto.arima(deseasonal_wtmp, seasonal=TRUE)
+fit_w_seasonality
+seas_fcast <- forecast(fit_w_seasonality, h=1200)
+plot(seas_fcast)
+```
+
+# 7.0 Comparisons of Different Model Types
+```{r comparisons}
+
+```
+
+# 8.0 Outliers
+```{r outliers}
+```
+
+# 9.0 Predicting to New Data (Trinity R.)
+```{r predicting_new_data}
+# build the new data frame
+newdf <- rfdf
+newdf <- merge(newdf, resflow_trin, by="DATE")
+newdf <- newdf[ , c(2,1,3:ncol(newdf))]
+newdf$RESINFLOW <- newdf$RESINFLOW_TRIN
+newdf$WATERTEMP <- 0
+newdf <- newdf[ ,1:(ncol(newdf)-1)]
+newdf$train <- 0
+
+# predict to the new data using the built rf model
+rfp_trin <- predict(rf1$RRF, newdf[, 1:17], type="response")
+newdata_results <- cbind(newdf, rfp_trin)
+newdata_results_sorted <- newdata_results[order(newdata_results[ , ncol(newdata_results)]), ]
+
+# plot sorted
+png(paste0('outputdata/Rplot19_newdata1.png'), width=4.5, height=4.9, units="in", pointsize=12, res=1200)
+par(mar=c(4.5,4.5,1,1)+0.1)
+plot(newdata_results_sorted$rfp_trin, col="goldenrod", ylab="Water Temp (F)", ylim=c(0,100), xlab="Rank Sorted Observations")
+dev.off()
+
+png(paste0('outputdata/Rplot19_newdata2.png'), width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,4,1,1)+0.1, ps=8, cex = 1, mgp = c(2,1,0))
+plot(ecdf(newdata_results$rfp_trin), xlim=c(30,90), xlab = substitute(paste('Sorted Temperature', B * degree, "F)"),  list(B = " (")), ylab = '', main="", do.points=TRUE, panel.first=c(abline(v=seq(30,90,10), lty=3, col="grey"), abline(h=seq(0,1,0.2), lty=3, col="grey")))
+# add label for y-axis
+# the "line" option is used to set the position of the label
+mtext(text = expression(hat(F)[n](x)), side = 2, line = 3)
+mtext(text='Percentiles for Hourly Water Temperature', side=2, line=2)
+dev.off()
+
+# build ts
+newdata_results <- newdata_results[order(newdata_results$DATETIME),]
+write.csv(newdata_results, paste0('outputdata/newdata_results_rf1.csv'))
+
+# the first time round the plot shoed axis by month, this time do it by year
+# png(paste0('outputdata/Rplot12_timeseries_rf1.png'), width=8.5, height=4.9, units="in", pointsize=12, res=1200)
+# par(mar=c(4.5,4.5,1,1)+0.1)
+# abs_error2 <- abs(rf1$TESTRESULTS$WATERTEMP-rf1$TESTRESULTS$RFP)
+# plot(rf1$TESTRESULTS$DATETIME, rf1$TESTRESULTS$RFP, ylab="Water Temp (F)", xlab="", xaxt="n", col=ifelse(abs_error2>=5,"red","goldenrod"))
+# axis.POSIXct(side=1, rf1$TESTRESULTS$DATETIME, at=cut(rf1$TESTRESULTS$DATETIME, "years"), format="%m/%d/%y", las=2)
+# points(rf1$TESTRESULTS$DATETIME, rf1$TESTRESULTS$WATERTEMP, col="darkblue")
+# legend("topleft", inset=0.025, cex=0.8, title="Legend", c("Observed", "Predicted"), horiz=FALSE, pch=c(1,1), col=c("darkblue","goldenrod"), bg="grey96")
+# dev.off()
+```
+
+# 10.0 Blocking in time
+```{r randfolds}
+# library(dismo)
+# rfdf$folds <- kfold(dim(rfdf)[1], k=5)
+# nfolds <- 5
+# 
+# library(foreach)
+# library(doParallel)
+# cl <- makeCluster(5)
+# registerDoParallel(cl)
+# 
+# # random 
+# srfrand <- foreach(i=1:nfolds) %dopar% {
+#   library(randomForest)
+#   trainset_rand <- rfdf[rfdf$folds!=i, ]
+#   testset_rand <- rfdf[rfdf$folds==i, ]
+#   # trf <- tuneRF(trainset_rand[ , c(4:(ncol(trainset_rand)-3))], trainset_rand[ , (ncol(trainset_rand)-2)])
+#   # mt <- trf[which.min(trf[,2]), 1]
+#   rrf <- randomForest(trainset_rand[ , c(4:17)], trainset_rand[ , 18], mtry=8, ntree=150)
+#   rfp <- predict(rrf, testset_rand[ , c(4:17)], type="response")
+# }
+# stopImplicitCluster(cl)
+# stopCluster(cl)
+# 
+# 
+# # put in right place
+# rfdf$RAND_FITTED <- NA
+# for(i in 1:nfolds){
+#   rfdf[rfdf$folds==i, "RAND_FITTED"] <- srfrand[[i]]
+# }
+#
+# saveRDS(rfdf, "intermediarydata/rfdf.RDS")
+rfdf <- readRDS("intermediarydata/rfdf.RDS")
+```
+
+## 10.1 One Year Blocks
+```{r blockingcv_1year}
+# nblocks <- 16/1
+# rfdf$bl1year <- as.numeric(substr(rfdf$DATE,1,4))-2001
+# 
+# cl <- makeCluster(5)
+# registerDoParallel(cl)
+# 
+# srfblocking1 <- foreach(i=1:nblocks) %dopar% {
+#   library(randomForest)
+#   trainset_rand <- rfdf[rfdf$bl1year!=i, ]
+#   testset_rand <- rfdf[rfdf$bl1year==i, ]
+#   rrf <- randomForest(trainset_rand[ ,c(4:17)], trainset_rand[ ,18], mtry=8, ntree=150)
+#   rfp <- predict(rrf, testset_rand[ ,c(4:17)], type="response")
+# }
+# stopImplicitCluster()
+# 
+# # put in right place
+# rfdf$BL1YEAR_FITTED <- NA
+# for(i in 1:nblocks){
+#   rfdf[rfdf$bl1year==i, "BL1YEAR_FITTED"] <- srfblocking1[[i]]
+# }
+#
+# saveRDS(rfdf, "intermediarydata/rfdf.RDS")
+rfdf <- readRDS("intermediarydata/rfdf.RDS")
+```
+
+## 10.2 Two Year Blocks
+```{r blockingcv_2year}
+# nblocks <- 16/2 
+# 
+# library(plyr)
+# rfdf$bl2year <- mapvalues(as.numeric(substr(rfdf$DATE, 1, 4)), from=2002:2017, to=c(1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8))
+# 
+# srfblocking2 <- foreach(i=1:nblocks) %dopar% {
+#   library(randomForest)
+#   trainset_rand <- rfdf[rfdf$bl2year!=i, ]
+#   testset_rand <- rfdf[rfdf$bl2year==i, ]
+#   rrf <- randomForest(trainset_rand[ , c(4:17)], trainset_rand[ , 18], mtry=8, ntree=200)
+#   rfp <- predict(rrf, testset_rand[ , c(4:17)], type="response")
+# }
+# stopImplicitCluster()
+# 
+# # put in right place
+# rfdf$BL2YEAR_FITTED <- NA
+# for(i in 1:nblocks){
+#   rfdf[rfdf$bl2year==i, "BL2YEAR_FITTED"] <- srfblocking2[[i]]
+# }
+# 
+# saveRDS(rfdf, "intermediarydata/rfdf.RDS")
+rfdf <- readRDS("intermediarydata/rfdf.RDS")
+```
+
+## 10.3 Four Year Blocks
+```{r blockingcv_4year}
+# nblocks <- 16/4
+# rfdf$bl4year <- mapvalues(as.numeric(substr(rfdf$DATE, 1, 4)), from=2002:2017, to=c(1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4))
+# 
+# srfblocking4 <- foreach(i=1:nblocks) %dopar% {
+#   library(randomForest)
+#   trainset_rand <- rfdf[rfdf$bl4year!=i, ]
+#   testset_rand <- rfdf[rfdf$bl4year==i, ]
+#   rrf <- randomForest(trainset_rand[ , c(4:17)], trainset_rand[ , 18], mtry=8, ntree=200)
+#   rfp <- predict(rrf, testset_rand[ , c(4:17)], type="response")
+# }
+# stopImplicitCluster()
+# 
+# # put in right place
+# rfdf$BL4YEAR_FITTED <- NA
+# for(i in 1:nblocks){
+#   rfdf[rfdf$bl4year==i, "BL4YEAR_FITTED"] <- srfblocking4[[i]]
+# }
+#
+# saveRDS(rfdf, "intermediarydata/rfdf.RDS")
+rfdf <- readRDS("intermediarydata/rfdf.RDS")
+```
+
+## 10.4 Eight Year Blocks
+```{r blockingcv_8year}
+# nblocks <- 16/8
+# rfdf$bl8year <- mapvalues(as.numeric(substr(rfdf$DATE, 1, 4)), from=2002:2017, to=c(1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2))
+# 
+# srfblocking8 <- foreach(i=1:nblocks) %dopar% {
+#   library(randomForest)
+#   trainset_rand <- rfdf[rfdf$bl8year!=i, ]
+#   testset_rand <- rfdf[rfdf$bl8year==i, ]
+#   rrf <- randomForest(trainset_rand[ , c(4:17)], trainset_rand[ , 18], mtry=8, ntree=200)
+#   rfp <- predict(rrf, testset_rand[ , c(4:17)], type="response")
+# }
+# stopImplicitCluster()
+# 
+# # put in right place
+# rfdf$BL8YEAR_FITTED <- NA
+# for(i in 1:nblocks){
+#   rfdf[rfdf$bl8year==i, "BL8YEAR_FITTED"] <- srfblocking8[[i]]
+# }
+# 
+# saveRDS(rfdf, "intermediarydata/rfdf.RDS")
+rfdf <- readRDS("intermediarydata/rfdf.RDS")
+```
+
+# 11.0 Model Fit
+```{r blockmodel_mof}
+modelfitae <- list()
+modelfitre <- list()
+modelfitr2 <- list()
+modelfitnse <- list()
+modelfitrmse <- list()
+modelfitrsr <- list()
+modelfitpbias <- list()
+mfcols <- c(21,23,25,27)
+
+for(i in seq_along(mfcols)){
+  nblocks <- max(rfdf[, mfcols[i]])
+  for(j in 1:nblocks){
+    obs <- rfdf[rfdf[, mfcols[i]]==j, "WATERTEMP"]
+    pred <- rfdf[rfdf[, mfcols[i]]==j, mfcols[i]+1]
+    
+    aecalc <- mean(ae(obs, pred))
+    modelfitae <- c(modelfitae, aecalc)
+    
+    recalc <- mean(re(obs, pred))
+    modelfitre <- c(modelfitre, recalc)
+    
+    r2calc <- r2(obs, pred)
+    modelfitr2 <- c(modelfitr2, r2calc)
+    
+    nsecalc <- nse(obs, pred)
+    modelfitnse <- c(modelfitnse, nsecalc)
+    
+    rmsecalc <- rmse(obs, pred)
+    modelfitrmse <- c(modelfitrmse, rmsecalc)
+    
+    rsrcalc <- rsr(obs, pred)
+    modelfitrsr <- c(modelfitrsr, rsrcalc)
+    
+    pbiascalc <- pbias(obs, pred)
+    modelfitpbias <- c(modelfitpbias, pbiascalc)
+  }
+}
+
+# for random folds
+rmodelfitae <- list()
+rmodelfitre <- list()
+rmodelfitr2 <- list()
+rmodelfitnse <- list()
+rmodelfitrmse <- list()
+rmodelfitrsr <- list()
+rmodelfitpbias <- list()
+nblocks <- max(rfdf[, 19])
+for(j in 1:nblocks){
+  obs <- rfdf[rfdf[, 19]==j, "WATERTEMP"]
+  pred <- rfdf[rfdf[, 19]==j, 20]
+  
+  aecalc <- mean(ae(obs, pred))
+  rmodelfitae <- c(rmodelfitae, aecalc)
+  
+  recalc <- mean(re(obs, pred))
+  rmodelfitre <- c(rmodelfitre, recalc)
+  
+  r2calc <- r2(obs, pred)
+  rmodelfitr2 <- c(rmodelfitr2, r2calc)
+  
+  nsecalc <- nse(obs, pred)
+  rmodelfitnse <- c(rmodelfitnse, nsecalc)
+  
+  rmsecalc <- rmse(obs, pred)
+  rmodelfitrmse <- c(rmodelfitrmse, rmsecalc)
+  
+  rsrcalc <- rsr(obs, pred)
+  rmodelfitrsr <- c(rmodelfitrsr, rsrcalc)
+  
+  pbiascalc <- pbias(obs, pred)
+  rmodelfitpbias <- c(rmodelfitpbias, pbiascalc)
+}
+
+# the first 16 are for bl1year, the next 8 are for bl2year, the next 4 are for bl4year and the next 2 are for bl8year
+
+# find the mean of all the folds
+modelfitr2 <- unlist(modelfitr2)
+mean(modelfitr2[1:15]) # taken 2017 out cause there isn't a long enough record for it
+mean(modelfitr2[17:24])
+mean(modelfitr2[25:28])
+mean(modelfitr2[29:30])
+
+modelfitae <- unlist(modelfitae)
+modelfitre <- unlist(modelfitre)
+modelfitnse <- unlist(modelfitnse)
+modelfitrmse <- unlist(modelfitrmse)
+modelfitrsr <- unlist(modelfitrsr)
+modelfitpbias <- unlist(modelfitpbias)
+
+rmodelfitae <- unlist(rmodelfitae)
+rmodelfitre <- unlist(rmodelfitre)
+rmodelfitr2 <- unlist(rmodelfitr2)
+rmodelfitnse <- unlist(rmodelfitnse)
+rmodelfitrmse <- unlist(rmodelfitrmse)
+rmodelfitrsr <- unlist(rmodelfitrsr)
+rmodelfitpbias <- unlist(rmodelfitpbias)
+
+#-----------------------------------------------
+mofae <- cbind(mean(rmodelfitae), mean(modelfitae[1:15]), mean(modelfitae[17:24]), mean(modelfitae[25:28]), mean(modelfitae[29:30]))
+mofre <- cbind(mean(rmodelfitre), mean(modelfitre[1:15]), mean(modelfitre[17:24]), mean(modelfitre[25:28]), mean(modelfitre[29:30]))
+mofr2 <- cbind(mean(rmodelfitr2), mean(modelfitr2[1:15]), mean(modelfitr2[17:24]), mean(modelfitr2[25:28]), mean(modelfitr2[29:30]))
+mofnse <- cbind(mean(rmodelfitnse), mean(modelfitnse[1:15]), mean(modelfitnse[17:24]), mean(modelfitnse[25:28]), mean(modelfitnse[29:30]))
+mofrmse <- cbind(mean(rmodelfitrmse), mean(modelfitrmse[1:15]), mean(modelfitrmse[17:24]), mean(modelfitrmse[25:28]), mean(modelfitrmse[29:30]))
+mofrsr <- cbind(mean(rmodelfitrsr), mean(modelfitrsr[1:15]), mean(modelfitrsr[17:24]), mean(modelfitrsr[25:28]), mean(modelfitrsr[29:30]))
+mofpbias <- cbind(mean(rmodelfitpbias), mean(modelfitpbias[1:15]), mean(modelfitpbias[17:24]), mean(modelfitpbias[25:28]), mean(modelfitpbias[29:30]))
+
+moftable <- rbind(mofae, mofre, mofr2, mofnse, mofrmse, mofrsr, mofpbias)
+colnames(moftable) <- c("random", "1 yr blocking", "2 yr blocking", "4 yr blocking", "8 yr blocking")
+rownames(moftable) <- c("E", "RE", "R2", "NSE", "RMSE", "RSR", "PBIAS")
+moftable <- round(moftable, 5)
+moftable
+write.csv(moftable, 'outputdata/model_fit.csv')
+```
+
+```{r mofcomp_plot}
+library(reshape2)
+png('outputdata/Rplot11_mofcomp_ae.png', width=3.25, height=1.75, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1)
+values <- matrix(moftable[1, ], nrow=1, ncol=5)
+colnames(values) <- colnames(moftable)
+rownames(values) <- rownames(moftable)[1]
+values <- melt(values[1, ])
+dotchart(values$value, labels=rownames(values), xlab="Mean Error", pch=19, xlim=c(-0.06, 0.02))
+text(x=values$value, y=1:dim(values)[1], labels=round(values$value,2), pos=4, cex=1)
+dev.off()
+
+png('outputdata/Rplot11_mofcomp_re.png', width=3.25, height=1.75, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1)
+values <- matrix(moftable[2, ], nrow=1, ncol=5)
+colnames(values) <- colnames(moftable)
+rownames(values) <- rownames(moftable)[1]
+values <- melt(values[1, ])
+dotchart(values$value, labels=rownames(values), xlab="Relative Error", pch=19, xlim=c(-0.0005, 0.001))
+text(x=values$value, y=1:dim(values)[1], labels=round(values$value,5), pos=4, cex=1)
+dev.off()
+
+png('outputdata/Rplot11_mofcomp_r2.png', width=3.25, height=1.75, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1)
+values <- matrix(moftable[3, ], nrow=1, ncol=5)
+colnames(values) <- colnames(moftable)
+rownames(values) <- rownames(moftable)[1]
+values <- melt(values[1, ])
+dotchart(values$value, labels=rownames(values), xlab="R2", pch=19, xlim=c(0.96, 1.01))
+text(x=values$value, y=1:dim(values)[1], labels=round(values$value,3), pos=4, cex=1)
+dev.off()
+
+png('outputdata/Rplot11_mofcomp_nse.png', width=3.25, height=1.75, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1)
+values <- matrix(moftable[4, ], nrow=1, ncol=5)
+colnames(values) <- colnames(moftable)
+rownames(values) <- rownames(moftable)[1]
+values <- melt(values[1, ])
+dotchart(values$value, labels=rownames(values), xlab="NSE", pch=19, xlim=c(0.978, 1.001))
+text(x=values$value, y=1:dim(values)[1], labels=round(values$value,3), pos=4, cex=1)
+dev.off()
+
+png('outputdata/Rplot11_mofcomp_rmse.png', width=3.25, height=1.75, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1)
+values <- matrix(moftable[5, ], nrow=1, ncol=5)
+colnames(values) <- colnames(moftable)
+rownames(values) <- rownames(moftable)[1]
+values <- melt(values[1, ])
+dotchart(values$value, labels=rownames(values), xlab="RMSE", pch=19, xlim=c(0.4, 1.6))
+text(x=values$value, y=1:dim(values)[1], labels=round(values$value,3), pos=4, cex=1)
+dev.off()
+
+png('outputdata/Rplot11_mofcomp_rsr.png', width=3.25, height=1.75, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1)
+values <- matrix(moftable[6, ], nrow=1, ncol=5)
+colnames(values) <- colnames(moftable)
+rownames(values) <- rownames(moftable)[1]
+values <- melt(values[1, ])
+dotchart(values$value, labels=rownames(values), xlab="RSR", pch=19, xlim=c(0.04, 0.16))
+text(x=values$value, y=1:dim(values)[1], labels=round(values$value,3), pos=4, cex=1)
+dev.off()
+
+png('outputdata/Rplot11_mofcomp_pbias.png', width=3.25, height=1.75, units="in", pointsize=8, res=1200)
+par(mar=c(4,8,1,1)+0.1, ps=8, cex=1)
+values <- matrix(moftable[7, ], nrow=1, ncol=5)
+colnames(values) <- colnames(moftable)
+rownames(values) <- rownames(moftable)[1]
+values <- melt(values[1, ])
+dotchart(values$value, labels=rownames(values), xlab="PBIAS", pch=19, xlim=c(-0.04, 0.01))
+text(x=values$value, y=1:dim(values)[1], labels=round(values$value,3), pos=4, cex=1)
+dev.off()
+```
+
+# 12.0 Plots
+```{r plottingfun}
+# change the date columns to be recognized at date formats
+rfdf$DATE <- as.Date(rfdf$DATE, format="%Y-%m-%d")
+rfdf$DATETIME <- as.POSIXct(rfdf$DATETIME, "%Y-%m-%d %H:%M:%S")
+
+library(ggplot2)
+png('outputdata/Rplot10_timeseries0.png', width=6.5, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(4,4,3,1)+0.1, ps=8, cex=1)
+ggplot(rfdf, aes(DATETIME)) +  
+  xlab("") + 
+  ylab(substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " ("))) +
+  geom_line(aes(y = bl1year+17, color = "3")) + 
+  geom_line(aes(y = bl2year+16, color = "4")) + 
+  geom_line(aes(y = bl4year+15, color = "5")) + 
+  geom_line(aes(y = bl8year+14, color = "6")) +
+  geom_line(aes(y = WATERTEMP, color = "1")) +
+  scale_colour_manual(name="", values=c("1"="black", "3"="orange", "4"="green", "5"="blue", "6"="purple"), labels=c("observed", "1 yr blocking", "2 yr blocking", "4 yr blocking", "8 yr blocking")) 
+dev.off()
+  
+png('outputdata/Rplot10_timeseries1.png', width=6.5, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(4,4,3,1)+0.1, ps=8, cex=1)
+ggplot(rfdf, aes(DATETIME)) + 
+  xlab("") + 
+  ylab(substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " ("))) +
+  geom_line(aes(y = RAND_FITTED, color = "2")) +
+  geom_line(aes(y = BL1YEAR_FITTED, color = "3")) + 
+  geom_line(aes(y = BL2YEAR_FITTED, color = "4")) + 
+  geom_line(aes(y = BL4YEAR_FITTED, color = "5")) + 
+  geom_line(aes(y = BL8YEAR_FITTED, color = "6")) +
+  geom_line(aes(y = WATERTEMP, color = "1")) + 
+  scale_colour_manual(name="", values=c("1"="black", "2"="red", "3"="orange", "4"="green", "5"="blue", "6"="purple"), labels=c("observed", "random", "1 yr blocking", "2 yr blocking", "4 yr blocking", "8 yr blocking"))
+dev.off()
+
+png('outputdata/Rplot10_timeseries2.png', width=6.5, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(4,4,3,1)+0.1, ps=8, cex=1)
+ggplot(rfdf[1:1000,], aes(DATETIME)) + 
+  xlab("") + 
+  ylab(substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " ("))) +
+  geom_line(aes(y = RAND_FITTED, color = "2")) +
+  geom_line(aes(y = BL1YEAR_FITTED, color = "3")) + 
+  geom_line(aes(y = BL2YEAR_FITTED, color = "4")) + 
+  geom_line(aes(y = BL4YEAR_FITTED, color = "5")) + 
+  geom_line(aes(y = BL8YEAR_FITTED, color = "6")) +
+  geom_line(aes(y = WATERTEMP, color = "1")) +
+  scale_colour_manual(name="", values=c("1"="black", "2"="red", "3"="orange", "4"="green", "5"="blue", "6"="purple"), labels=c("observed", "random", "1 yr blocking", "2 yr blocking", "4 yr blocking", "8 yr blocking")) 
+dev.off()
+
+png('outputdata/Rplot10_timeseries3.png', width=6.5, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(4,4,3,1)+0.1, ps=8, cex=1)
+ggplot(rfdf[1001:2000,], aes(DATETIME)) + 
+  xlab("") + 
+  ylab(substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " ("))) +
+  geom_line(aes(y = RAND_FITTED, color = "2")) +
+  geom_line(aes(y = BL1YEAR_FITTED, color = "3")) + 
+  geom_line(aes(y = BL2YEAR_FITTED, color = "4")) + 
+  geom_line(aes(y = BL4YEAR_FITTED, color = "5")) + 
+  geom_line(aes(y = BL8YEAR_FITTED, color = "6")) +
+  geom_line(aes(y = WATERTEMP, color = "1")) + 
+  scale_colour_manual(name="", values=c("1"="black", "2"="red", "3"="orange", "4"="green", "5"="blue", "6"="purple"), labels=c("observed", "random", "1 yr blocking", "2 yr blocking", "4 yr blocking", "8 yr blocking"))
+dev.off()
+
+png('outputdata/Rplot10_timeseries4.png', width=6.5, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(4,4,3,1)+0.1, ps=8, cex=1)
+ggplot(rfdf[2001:2500,], aes(DATETIME)) + 
+  xlab("") + 
+  ylab(substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " ("))) +
+  geom_line(aes(y = RAND_FITTED, color = "2")) +
+  geom_line(aes(y = BL1YEAR_FITTED, color = "3")) + 
+  geom_line(aes(y = BL2YEAR_FITTED, color = "4")) + 
+  geom_line(aes(y = BL4YEAR_FITTED, color = "5")) + 
+  geom_line(aes(y = BL8YEAR_FITTED, color = "6")) +
+  geom_line(aes(y = WATERTEMP, color = "1")) + 
+  scale_colour_manual(name="", values=c("1"="black", "2"="red", "3"="orange", "4"="green", "5"="blue", "6"="purple"), labels=c("observed", "random", "1 yr blocking", "2 yr blocking", "4 yr blocking", "8 yr blocking")) 
+dev.off()
+
+png('outputdata/Rplot10_timeseries5.png', width=6.5, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(4,4,3,1)+0.1, ps=8, cex=1)
+ggplot(rfdf[2001:2250,], aes(DATETIME)) + 
+  xlab("") + 
+  ylab(substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " ("))) +
+  geom_line(aes(y = RAND_FITTED, color = "2")) +
+  geom_line(aes(y = BL1YEAR_FITTED, color = "3")) + 
+  geom_line(aes(y = BL2YEAR_FITTED, color = "4")) + 
+  geom_line(aes(y = BL4YEAR_FITTED, color = "5")) + 
+  geom_line(aes(y = BL8YEAR_FITTED, color = "6")) +
+  geom_line(aes(y = WATERTEMP, color = "1")) +
+  scale_colour_manual(name="", values=c("1"="black", "2"="red", "3"="orange", "4"="green", "5"="blue", "6"="purple"), labels=c("observed", "random", "1 yr blocking", "2 yr blocking", "4 yr blocking", "8 yr blocking")) 
+dev.off()
+
+tempresults <- ggplot(rfdf[1:1000,], aes(DATETIME, WATERTEMP)) +
+           geom_line(na.rm=TRUE) +  
+           ggtitle("Water Temperature Sacramento River \n 2002-2017") +
+           xlab("") + ylab("Water Temperature (F)") +
+           theme(plot.title = element_text(lineheight=.8, face="bold", 
+                                          size = 20)) +
+           theme(text = element_text(size=18))
+
+tempresults
+
+tempresults + geom_line(aes(y = BL1YEAR_FITTED), col="blue")
+
+plot(rfdf$DATETIME, rfdf$WATERTEMP, ylab='Temperature Deviations', type='n')    # set up the plot
+grid(lty=1, col=gray(.9))                                  
+lines(rfdf$WATERTEMP, type='o', col=4)
+
+ggplot(data = rfdf[1:1000,],  aes(x=DATETIME, y=WATERTEMP) )   +   
+                  ylab('Temperature Deviations')             +
+                  geom_line(col="blue")                      +
+                  geom_point(col="blue", pch=1)
+
+ggplot(data = rfdf[1:1000,], aes(x=DATETIME, color=variable)) +
+  ylab('Temperature Deviations') +
+  geom_line(aes(y = WATERTEMP , col='Observed'),  size=1, alpha=.5)  +
+  geom_line(aes(y = BL1YEAR_FITTED, col='1yr blocking'), size=1, alpha=.5)    +
+  geom_line(aes(y = BL2YEAR_FITTED, col = "2yr blocking")) +
+  geom_line(aes(y = BL4YEAR_FITTED, col = "4yr blocking")) +
+  geom_line(aes(y = BL8YEAR_FITTED, col = "8yr blocking")) +
+  theme(legend.position=c(.1,.85))
+
+
+library(astsa)
+par(mfrow=c(3,1))
+tsplot(rfdf$WATERTEMP[1:1000], ylab='Observed Temp (F)', col=4, main='', cex.main=1.5)
+tsplot(rfdf$BL1YEAR_FITTED[1:1000], ylab="1yr blocking", col=6)
+tsplot(rfdf$BL2YEAR_FITTED[1:1000], ylab="2yr blocking", col=3)
+```
+
+```{r blocking_ovsp_plots}
+# make this a hex plot ?
+png('outputdata/Rplot15_obsvspred_rand.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+abs_error <- abs(rfdf$WATERTEMP-rfdf$RAND_FITTED)
+cols <- colorRampPalette(c('white','darkblue'))
+smoothScatter(rfdf$WATERTEMP, rfdf$RAND_FITTED, nbin=100, colramp=cols, nrpoints=Inf, xlab=substitute(paste('Observed Temperature', B * degree, "F)"),  list(B = " (")), ylab=substitute(paste('Predicted Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), xlim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), col=ifelse(abs_error>=5,"red","darkblue"))
+abline(0,1, col="grey80", lty=2, lwd=1)
+lmline <- lm(rfdf$WATERTEMP~rfdf$RAND_FITTED)
+# abline(lmline)
+legend("bottomright", horiz=FALSE, inset=c(0.02, 0.02), cex=0.6, c("Y = X line", "Observations", "Large Errors"), lty=c(2,NA,NA), pch=c(NA,19,19), lwd=c(1,1,1), col=c("grey80","darkblue", "red"), bg="grey96", xpd=TRUE)
+mtext(paste("Y =", round(lmline$coefficients[2],3), "X +", round(lmline$coefficients[1],0)), side=3, line=-1, cex=0.8, adj=0.1)
+if(lmline$coefficients[2]>1){
+lmline <- lm(rfdf$RAND_FITTED~rfdf$WATERTEMP)
+}
+mtext(expression(paste("Model R"^2,":")), side=3, line=-1.6, cex=0.8, adj=0.1)
+mtext(round(lmline$coefficients[2],3), side=3, line=-1.6, cex=0.8, adj=0.28)
+dev.off()
+
+png('outputdata/Rplot15_obsvspred1.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+abs_error <- abs(rfdf$WATERTEMP-rfdf$BL1YEAR_FITTED)
+cols <- colorRampPalette(c('white','darkblue'))
+smoothScatter(rfdf$WATERTEMP, rfdf$BL1YEAR_FITTED, nbin=100, colramp=cols, nrpoints=Inf, xlab=substitute(paste('Observed Temperature', B * degree, "F)"),  list(B = " (")), ylab=substitute(paste('Predicted Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), xlim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), col=ifelse(abs_error>=5,"red","darkblue"))
+abline(0,1, col="grey80", lty=2, lwd=1)
+lmline <- lm(rfdf$WATERTEMP~rfdf$BL1YEAR_FITTED)
+# abline(lmline)
+legend("bottomright", horiz=FALSE, inset=c(0.02, 0.02), cex=0.6, c("Y = X line", "Observations", "Large Errors"), lty=c(2,NA,NA), pch=c(NA,19,19), lwd=c(1,1,1), col=c("grey80","darkblue", "red"), bg="grey96", xpd=TRUE)
+mtext(paste("Y =", round(lmline$coefficients[2],3), "X +", round(lmline$coefficients[1],0)), side=3, line=-1, cex=0.8, adj=0.1)
+if(lmline$coefficients[2]>1){
+lmline <- lm(rfdf$BL1YEAR_FITTED~rfdf$WATERTEMP)
+}
+mtext(expression(paste("Model R"^2,":")), side=3, line=-1.6, cex=0.8, adj=0.1)
+mtext(round(lmline$coefficients[2],3), side=3, line=-1.6, cex=0.8, adj=0.28)
+dev.off()
+
+png('outputdata/Rplot15_obsvspred2.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+abs_error <- abs(rfdf$WATERTEMP-rfdf$BL2YEAR_FITTED)
+cols <- colorRampPalette(c('white','darkblue'))
+smoothScatter(rfdf$WATERTEMP, rfdf$BL2YEAR_FITTED, nbin=100, colramp=cols, nrpoints=Inf, xlab=substitute(paste('Observed Temperature', B * degree, "F)"),  list(B = " (")), ylab=substitute(paste('Predicted Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), xlim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), col=ifelse(abs_error>=5,"red","darkblue"))
+abline(0,1, col="grey80", lty=2, lwd=1)
+lmline <- lm(rfdf$WATERTEMP~rfdf$BL2YEAR_FITTED)
+# abline(lmline)
+legend("bottomright", horiz=FALSE, inset=c(0.02, 0.02), cex=0.6, c("Y = X line", "Observations", "Large Errors"), lty=c(2,NA,NA), pch=c(NA,19,19), lwd=c(1,1,1), col=c("grey80","darkblue", "red"), bg="grey96", xpd=TRUE)
+mtext(paste("Y =", round(lmline$coefficients[2],3), "X +", round(lmline$coefficients[1],0)), side=3, line=-1, cex=0.8, adj=0.1)
+if(lmline$coefficients[2]>1){
+lmline <- lm(rfdf$BL2YEAR_FITTED~rfdf$WATERTEMP)
+}
+mtext(expression(paste("Model R"^2,":")), side=3, line=-1.6, cex=0.8, adj=0.1)
+mtext(round(lmline$coefficients[2],3), side=3, line=-1.6, cex=0.8, adj=0.28)
+dev.off()
+
+png('outputdata/Rplot15_obsvspred4.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+abs_error <- abs(rfdf$WATERTEMP-rfdf$BL4YEAR_FITTED)
+cols <- colorRampPalette(c('white','darkblue'))
+smoothScatter(rfdf$WATERTEMP, rfdf$BL4YEAR_FITTED, nbin=100, colramp=cols, nrpoints=Inf, xlab=substitute(paste('Observed Temperature', B * degree, "F)"),  list(B = " (")), ylab=substitute(paste('Predicted Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), xlim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), col=ifelse(abs_error>=5,"red","darkblue"))
+abline(0,1, col="grey80", lty=2, lwd=1)
+lmline <- lm(rfdf$WATERTEMP~rfdf$BL4YEAR_FITTED)
+# abline(lmline)
+legend("bottomright", horiz=FALSE, inset=c(0.02, 0.02), cex=0.6, c("Y = X line", "Observations", "Large Errors"), lty=c(2,NA,NA), pch=c(NA,19,19), lwd=c(1,1,1), col=c("grey80","darkblue", "red"), bg="grey96", xpd=TRUE)
+mtext(paste("Y =", round(lmline$coefficients[2],3), "X +", round(lmline$coefficients[1],0)), side=3, line=-1, cex=0.8, adj=0.1)
+if(lmline$coefficients[2]>1){
+lmline <- lm(rfdf$BL4YEAR_FITTED~rfdf$WATERTEMP)
+}
+mtext(expression(paste("Model R"^2,":")), side=3, line=-1.6, cex=0.8, adj=0.1)
+mtext(round(lmline$coefficients[2],3), side=3, line=-1.6, cex=0.8, adj=0.28)
+dev.off()
+
+png('outputdata/Rplot15_obsvspred8.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,1,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+abs_error <- abs(rfdf$WATERTEMP-rfdf$BL8YEAR_FITTED)
+cols <- colorRampPalette(c('white','darkblue'))
+smoothScatter(rfdf$WATERTEMP, rfdf$BL8YEAR_FITTED, nbin=100, colramp=cols, nrpoints=Inf, xlab=substitute(paste('Observed Temperature', B * degree, "F)"),  list(B = " (")), ylab=substitute(paste('Predicted Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), xlim=c(min(rfdf$WATERTEMP), max(rfdf$WATERTEMP)), col=ifelse(abs_error>=5,"red","darkblue"))
+abline(0,1, col="grey80", lty=2, lwd=1)
+lmline <- lm(rfdf$WATERTEMP~rfdf$BL8YEAR_FITTED)
+# abline(lmline)
+legend("bottomright", horiz=FALSE, inset=c(0.02, 0.02), cex=0.6, c("Y = X line", "Observations", "Large Errors"), lty=c(2,NA,NA), pch=c(NA,19,19), lwd=c(1,1,1), col=c("grey80","darkblue", "red"), bg="grey96", xpd=TRUE)
+mtext(paste("Y =", round(lmline$coefficients[2],3), "X +", round(lmline$coefficients[1],0)), side=3, line=-1, cex=0.8, adj=0.1)
+if(lmline$coefficients[2]>1){
+lmline <- lm(rfdf$BL8YEAR_FITTED~rfdf$WATERTEMP)
+}
+mtext(expression(paste("Model R"^2,":")), side=3, line=-1.6, cex=0.8, adj=0.1)
+mtext(round(lmline$coefficients[2],3), side=3, line=-1.6, cex=0.8, adj=0.28)
+dev.off()
+```
+
+```{r blocking_ovsp_plots2}
+png('outputdata/Rplot16_obsvspred_sorted_random.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,3,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+rfdf_sorted <- rfdf[order(rfdf$WATERTEMP),]
+abs_error <- abs(rfdf_sorted$WATERTEMP-rfdf_sorted$RAND_FITTED)
+plot(rfdf_sorted$RAND_FITTED, col=ifelse(abs_error>=5,"red","goldenrod"), ylab=substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(0,100), xlab="Rank Sorted Observations", main="random")
+points(rfdf_sorted$WATERTEMP, col="darkblue")
+legend("topleft", inset=c(0.02, 0.02), cex=0.8, c("Observed", "Predicted", "Large Errors"), horiz=FALSE, pch=c(1,1,1), col=c("darkblue","goldenrod","red"), bg="grey96")
+dev.off()
+
+png('outputdata/Rplot16_obsvspred_sorted1.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,3,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+rfdf_sorted <- rfdf[order(rfdf$WATERTEMP),]
+abs_error <- abs(rfdf_sorted$WATERTEMP-rfdf_sorted$BL1YEAR_FITTED)
+plot(rfdf_sorted$BL1YEAR_FITTED, col=ifelse(abs_error>=5,"red","goldenrod"), ylab=substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(0,100), xlab="Rank Sorted Observations", main="1yr blocking")
+points(rfdf_sorted$WATERTEMP, col="darkblue")
+legend("topleft", inset=c(0.02, 0.02), cex=0.8, c("Observed", "Predicted", "Large Errors"), horiz=FALSE, pch=c(1,1,1), col=c("darkblue","goldenrod","red"), bg="grey96")
+dev.off()
+
+png('outputdata/Rplot16_obsvspred_sorted2.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,3,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+rfdf_sorted <- rfdf[order(rfdf$WATERTEMP),]
+abs_error <- abs(rfdf_sorted$WATERTEMP-rfdf_sorted$BL2YEAR_FITTED)
+plot(rfdf_sorted$BL2YEAR_FITTED, col=ifelse(abs_error>=5,"red","goldenrod"), ylab=substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(0,100), xlab="Rank Sorted Observations",main="2yr blocking")
+points(rfdf_sorted$WATERTEMP, col="darkblue")
+legend("topleft", inset=c(0.02, 0.02), cex=0.8, c("Observed", "Predicted", "Large Errors"), horiz=FALSE, pch=c(1,1,1), col=c("darkblue","goldenrod","red"), bg="grey96")
+dev.off()
+
+png('outputdata/Rplot16_obsvspred_sorted4.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,3,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+rfdf_sorted <- rfdf[order(rfdf$WATERTEMP),]
+abs_error <- abs(rfdf_sorted$WATERTEMP-rfdf_sorted$BL4YEAR_FITTED)
+plot(rfdf_sorted$BL4YEAR_FITTED, col=ifelse(abs_error>=5,"red","goldenrod"), ylab=substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(0,100), xlab="Rank Sorted Observations", main="4yr blocking")
+points(rfdf_sorted$WATERTEMP, col="darkblue")
+legend("topleft", inset=c(0.02, 0.02), cex=0.8, c("Observed", "Predicted", "Large Errors"), horiz=FALSE, pch=c(1,1,1), col=c("darkblue","goldenrod","red"), bg="grey96")
+dev.off()
+
+png('outputdata/Rplot16_obsvspred_sorted8.png', width=3.25, height=2.85, units="in", pointsize=12, res=1200)
+par(mar=c(3,3,3,1)+0.1, ps=8, cex=1, mgp = c(2,1,0))
+rfdf_sorted <- rfdf[order(rfdf$WATERTEMP),]
+abs_error <- abs(rfdf_sorted$WATERTEMP-rfdf_sorted$BL8YEAR_FITTED)
+plot(rfdf_sorted$BL8YEAR_FITTED, col=ifelse(abs_error>=5,"red","goldenrod"), ylab=substitute(paste('Water Temperature', B * degree, "F)"),  list(B = " (")), ylim=c(0,100), xlab="Rank Sorted Observations", main="8yr blocking")
+points(rfdf_sorted$WATERTEMP, col="darkblue")
+legend("topleft", inset=c(0.02, 0.02), cex=0.8, c("Observed", "Predicted", "Large Errors"), horiz=FALSE, pch=c(1,1,1), col=c("darkblue","goldenrod","red"), bg="grey96")
+dev.off()
+```
+
+# 13.0 Exporting to DSS
+```{r bl_exporting}
+write.csv(rfdf, "outputdata/results_blocking.csv")
+```
+
+```{r plotplot}
+plot(rfdf$DATETIME, as.factor(rfdf$folds))
+```
+
+
+
+
+
+
+
